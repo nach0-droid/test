@@ -434,7 +434,7 @@ function defaultState(){
   for (var m = 1; m <= 8; m++) ac.push({ luna:'2026-' + pad(m), suma:null, inclus:true });
   return {
     version:1,
-    tarife:{ el:{ pret:null }, gaz:{ pret:null, pretPe:'m3', factorKwhPerM3:10.6 }, apa:{ pret:null } },
+    tarife:{ el:{ pret:null, abonamentZi:null }, gaz:{ pret:null, pretPe:'m3', factorKwhPerM3:10.6, abonamentZi:null }, apa:{ pret:null, abonamentZi:null } },
     bazaCalcul:'ultima',
     citiri:[],
     alteCheltuieli:ac
@@ -446,13 +446,14 @@ function migrate(s){
   var out = {
     version:1,
     tarife:{
-      el:{ pret:numOrNull(s.tarife && s.tarife.el && s.tarife.el.pret) },
+      el:{ pret:numOrNull(s.tarife && s.tarife.el && s.tarife.el.pret), abonamentZi:numOrNull(s.tarife && s.tarife.el && s.tarife.el.abonamentZi) },
       gaz:{
         pret:numOrNull(s.tarife && s.tarife.gaz && s.tarife.gaz.pret),
         pretPe:(s.tarife && s.tarife.gaz && s.tarife.gaz.pretPe === 'kwh') ? 'kwh' : 'm3',
-        factorKwhPerM3:numOrNull(s.tarife && s.tarife.gaz && s.tarife.gaz.factorKwhPerM3)
+        factorKwhPerM3:numOrNull(s.tarife && s.tarife.gaz && s.tarife.gaz.factorKwhPerM3),
+        abonamentZi:numOrNull(s.tarife && s.tarife.gaz && s.tarife.gaz.abonamentZi)
       },
-      apa:{ pret:numOrNull(s.tarife && s.tarife.apa && s.tarife.apa.pret) }
+      apa:{ pret:numOrNull(s.tarife && s.tarife.apa && s.tarife.apa.pret), abonamentZi:numOrNull(s.tarife && s.tarife.apa && s.tarife.apa.abonamentZi) }
     },
     bazaCalcul:s.bazaCalcul === 'ultimele3' ? 'ultimele3' : 'ultima',
     citiri:[],
@@ -544,6 +545,7 @@ function pretUnitar(id){
   if (id === 'gaz' && t.pretPe === 'kwh') return (t.factorKwhPerM3 && t.factorKwhPerM3 > 0) ? t.pret * t.factorKwhPerM3 : null;
   return t.pret;
 }
+function abonZi(id){ var t = state.tarife[id]; return (t && typeof t.abonamentZi === 'number' && t.abonamentZi > 0) ? t.abonamentZi : 0; }
 function pretText(id){
   var t = state.tarife[id], m = meter(id);
   if (!t || t.pret == null) return 'tarif necompletat';
@@ -558,7 +560,8 @@ function estimare(id){
   used.forEach(function(p){ consum += p.consum; zile += p.zile; });
   var lunar = zile > 0 ? consum / zile * ZILE_LUNA : 0;
   var pret = pretUnitar(id);
-  return { status:'ok', consumLunar:lunar, consum:consum, zile:zile, pret:pret, cost:pret == null ? null : lunar * pret, from:used[0].from, to:used[used.length-1].to, nPer:used.length };
+  var abonLunar = abonZi(id) * ZILE_LUNA;
+  return { status:'ok', consumLunar:lunar, consum:consum, zile:zile, pret:pret, abonLunar:abonLunar, cost:pret == null ? null : lunar * pret + abonLunar, from:used[0].from, to:used[used.length-1].to, nPer:used.length };
 }
 function mediaAlte(){
   var v = state.alteCheltuieli.filter(function(a){ return a.inclus && typeof a.suma === 'number'; });
@@ -587,10 +590,10 @@ function perioadaCurenta(){
 function rowCosts(){
   var map = {};
   METERS.forEach(function(m){
-    var pret = pretUnitar(m.id);
+    var pret = pretUnitar(m.id), ab = abonZi(m.id);
     periodsFor(m.id).forEach(function(p){
       if (!map[p.to.id]) map[p.to.id] = {};
-      map[p.to.id][m.id] = { consum:p.consum, zile:p.zile, cost:pret == null ? null : p.consum * pret, from:p.from };
+      map[p.to.id][m.id] = { consum:p.consum, zile:p.zile, abon:p.zile * ab, cost:pret == null ? null : p.consum * pret + p.zile * ab, from:p.from };
     });
   });
   return map;
@@ -609,8 +612,8 @@ function calculPerioada(per){
     for (var i = s.length - 1; i >= 0; i--) if (s[i].perioada === per) { end = s[i]; idx = i; break; }
     if (!end) { out.meters[m.id] = { status:'fara' }; return; }
     if (idx === 0) { out.meters[m.id] = { status:'prima', end:end }; return; }
-    var start = s[idx-1], consum = end[m.id] - start[m.id], zile = daysBetween(start.data, end.data), pret = pretUnitar(m.id);
-    out.meters[m.id] = { status:'ok', start:start, end:end, consum:consum, zile:zile, pret:pret, cost:pret == null ? null : consum * pret };
+    var start = s[idx-1], consum = end[m.id] - start[m.id], zile = daysBetween(start.data, end.data), pret = pretUnitar(m.id), ab = abonZi(m.id);
+    out.meters[m.id] = { status:'ok', start:start, end:end, consum:consum, zile:zile, pret:pret, abonZi:ab, abon:zile * ab, cost:pret == null ? null : consum * pret + zile * ab };
     if (!out.from || start.data < out.from) out.from = start.data;
     if (!out.to || end.data > out.to) out.to = end.data;
   });
@@ -638,15 +641,17 @@ function meterDet(m, e){
   if (e.status === 'prima') return 'prima citire <span class="lcd">' + num(e.end[m.id], m.dec) + '</span> ' + fmtData(e.end.data) + ', <b>fără interval încă</b>';
   var t = '<span class="lcd">' + num(e.start[m.id], m.dec) + '</span> ' + fmtData(e.start.data) + ' → <span class="lcd">' + num(e.end[m.id], m.dec) + '</span> ' + fmtData(e.end.data) +
           ' · <b>' + num(e.consum, m.dec) + ' ' + m.unit + '</b> în ' + e.zile + ' zile';
-  t += e.pret != null ? ' × ' + num(e.pret, 4) + ' lei/' + m.unit + ' = <b>' + lei(e.cost) + '</b>' : ' · <b>tarif necompletat</b>';
-  return t;
+  if (e.pret == null) return t + ' · <b>tarif necompletat</b>';
+  if (e.abon > 0) return t + ' × ' + num(e.pret, 4) + ' lei/' + m.unit + ' = ' + lei(e.consum * e.pret) + ' + abonament ' + e.zile + ' zile × ' + num(e.abonZi, 4) + ' = ' + lei(e.abon) + ' → <b>' + lei(e.cost) + '</b>';
+  return t + ' × ' + num(e.pret, 4) + ' lei/' + m.unit + ' = <b>' + lei(e.cost) + '</b>';
 }
 function meterDetText(m, e){
   if (e.status === 'fara') return 'fără citire în această perioadă';
   if (e.status === 'prima') return 'prima citire ' + num(e.end[m.id], m.dec) + ' ' + m.unit + ' (' + fmtData(e.end.data) + '), fără interval încă';
   var t = num(e.start[m.id], m.dec) + ' (' + fmtData(e.start.data) + ') → ' + num(e.end[m.id], m.dec) + ' (' + fmtData(e.end.data) + ') = ' + num(e.consum, m.dec) + ' ' + m.unit + ' în ' + e.zile + ' zile';
-  t += e.pret != null ? ' × ' + num(e.pret, 4) + ' lei/' + m.unit + ' = ' + lei(e.cost) : ', tarif necompletat';
-  return t;
+  if (e.pret == null) return t + ', tarif necompletat';
+  if (e.abon > 0) return t + ' × ' + num(e.pret, 4) + ' lei/' + m.unit + ' = ' + lei(e.consum * e.pret) + ' + abonament ' + e.zile + ' zile × ' + num(e.abonZi, 4) + ' = ' + lei(e.abon) + ' → ' + lei(e.cost);
+  return t + ' × ' + num(e.pret, 4) + ' lei/' + m.unit + ' = ' + lei(e.cost);
 }
 function prow(m, e, dotCls){
   return '<div class="prow"><div class="name"><span class="dot ' + dotCls + '"></span>' + m.nume + '</div><div class="det"><span>' + meterDet(m, e) + '</span></div><div class="cost">' + (e.status === 'ok' && e.cost != null ? lei(e.cost) : '—') + '</div></div>';
@@ -709,6 +714,7 @@ function tile(cls, nume, e, m, pt){
     sub += '<span>Consum: <b>≈ ' + num(e.consumLunar, m.dec) + ' ' + m.unit + '/lună</b></span>';
     sub += '<span>' + num(e.consum, m.dec) + ' ' + m.unit + ' în ' + e.zile + ' zile (' + fmtData(e.from.data) + ' → ' + fmtData(e.to.data) + ')</span>';
     sub += '<span>Tarif: <b>' + esc(pt) + '</b></span>';
+    if (e.abonLunar > 0) sub += '<span>Abonament: <b>' + lei(e.abonLunar) + '</b>/lună</span>';
     if (e.cost == null) sub += '<span><span class="pill warn">completează tariful</span></span>';
   } else if (e.status === 'una') {
     val = '—';
@@ -771,7 +777,7 @@ function updateLive(){
     if (!nb.prev) { liveEl.textContent = 'Prima citire a acestui contor. Consumul apare de la a doua.'; return; }
     var consum = v - nb.prev[m.id], zile = daysBetween(nb.prev.data, data), pret = pretUnitar(m.id);
     var t = 'Consum <b>' + num(consum, m.dec) + ' ' + m.unit + '</b> în ' + zile + ' zile';
-    if (pret != null) t += ' → <b>' + lei(consum * pret) + '</b>';
+    if (pret != null) t += ' → <b>' + lei(consum * pret + zile * abonZi(m.id)) + '</b>' + (abonZi(m.id) > 0 ? ' <span class="muted">(incl. abonament ' + lei(zile * abonZi(m.id)) + ')</span>' : '');
     if (zile > 0) t += ' <span class="muted">(≈ ' + num(consum / zile * ZILE_LUNA, m.dec) + ' ' + m.unit + '/lună)</span>';
     liveEl.innerHTML = t;
   });
@@ -862,10 +868,21 @@ function buildTarife(){
       else { state.tarife[m.id].pret = v; inp.value = String(v).replace('.', ','); }
       save(); renderDerived();
     });
+    var ab = $('abon_' + m.id);
+    ab.value = state.tarife[m.id].abonamentZi == null ? '' : String(state.tarife[m.id].abonamentZi).replace('.', ',');
+    ab.addEventListener('change', function(){
+      var v = parseNum(ab.value);
+      if (v == null || isNaN(v) || v <= 0) { state.tarife[m.id].abonamentZi = null; ab.value = ''; }
+      else { state.tarife[m.id].abonamentZi = v; ab.value = String(v).replace('.', ','); }
+      save(); renderDerived();
+    });
     var fb = $('fb_' + m.id);
     fb.addEventListener('click', function(){
       var suma = parseNum($('fs_' + m.id).value), cons = parseNum($('fc_' + m.id).value);
       if (suma == null || cons == null || isNaN(suma) || isNaN(cons) || cons <= 0) { toast('Completează suma și consumul de pe factură'); return; }
+      var faEl = $('fa_' + m.id), fa = faEl ? parseNum(faEl.value) : null;
+      if (fa != null && !isNaN(fa) && fa > 0) suma -= fa;
+      if (suma <= 0) { toast('Abonamentul nu poate depăși totalul facturii'); return; }
       var p = Math.round(suma / cons * 10000) / 10000;
       state.tarife[m.id].pret = p; inp.value = String(p).replace('.', ',');
       save(); renderDerived(); toast('Tarif calculat: ' + num(p, 4) + ' lei/' + gazUnit(m.id));
@@ -896,10 +913,12 @@ function tarifBlock(id, nume, unitLabel, dotCls){
     (isGaz ? '<label class="small muted" style="display:flex;gap:6px;align-items:center">Prețul e pe <select id="gazPretPe" style="width:auto;padding:4px 8px"><option value="m3">m³</option><option value="kwh">kWh</option></select></label>' : '') +
     '</div><div class="grid2">' +
     '<div class="field"><label for="pret_' + id + '">Preț <span class="muted" id="u_' + id + '" style="font-weight:400">' + (unitLabel || 'lei/m³') + '</span></label><input class="num" type="text" inputmode="decimal" id="pret_' + id + '" placeholder="ex. 1,25"></div>' +
-    (isGaz ? '<div class="field" id="gazFactorWrap"><label for="gazFactor">Factor conversie <span class="muted" style="font-weight:400">kWh/m³</span></label><input class="num" type="text" inputmode="decimal" id="gazFactor" placeholder="de pe factură, ex. 10,6"></div>' : '') +
+    (isGaz ? '<div class="field" id="gazFactorWrap"><label for="gazFactor">Factor conversie <span class="muted" style="font-weight:400">kWh/m³</span></label><input class="num" type="text" inputmode="decimal" id="gazFactor" placeholder="PCS de pe factură, ex. 10,461"></div>' : '') +
+    '<div class="field"><label for="abon_' + id + '">Abonament <span class="muted" style="font-weight:400">lei/zi, cu TVA</span></label><input class="num" type="text" inputmode="decimal" id="abon_' + id + '" placeholder="' + (isGaz ? 'ex. 0,8833 (0,73 + TVA 21%)' : 'opțional') + '"></div>' +
     '</div>' +
     '<details class="helper"><summary>Calculează din factură</summary><div class="body">' +
     '<div class="field"><label for="fs_' + id + '">Total factură (lei)</label><input class="num" type="text" inputmode="decimal" id="fs_' + id + '" placeholder="ex. 187,40"></div>' +
+    (isGaz ? '<div class="field"><label for="fa_gaz">din care abonament (lei)</label><input class="num" type="text" inputmode="decimal" id="fa_gaz" placeholder="ex. 26,50"></div>' : '') +
     '<div class="field"><label for="fc_' + id + '">Consum facturat (<span id="fcu_' + id + '">' + (id === 'el' ? 'kWh' : 'm³') + '</span>)</label><input class="num" type="text" inputmode="decimal" id="fc_' + id + '" placeholder="ex. 150"></div>' +
     '<div class="field"><button type="button" class="btn sm" id="fb_' + id + '">Calculează prețul</button></div>' +
     '</div></details></div>';
@@ -977,7 +996,7 @@ function renderIstoric(){
           h += '<div class="cell"><span><span class="lcd">' + num(r[m.id], m.dec) + '</span> <span class="small muted">' + m.unit + '</span></span>';
           var p = rc[m.id];
           if (p) {
-            h += '<span class="d">+' + num(p.consum, m.dec) + ' ' + m.unit + ' · ' + p.zile + ' z · <b>' + (p.cost != null ? lei(p.cost) : 'fără tarif') + '</b></span>';
+            h += '<span class="d">+' + num(p.consum, m.dec) + ' ' + m.unit + ' · ' + p.zile + ' z' + (p.abon > 0 ? ' · abon. ' + lei(p.abon) : '') + ' · <b>' + (p.cost != null ? lei(p.cost) : 'fără tarif') + '</b></span>';
             if (p.cost != null) { tot += p.cost; anyCost = true; sub[m.id] += p.cost; sub.has[m.id] = true; }
           } else h += '<span class="d">prima citire</span>';
           h += '</div>';
