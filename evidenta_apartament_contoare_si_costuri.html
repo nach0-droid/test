@@ -104,6 +104,22 @@ a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,su
 .pill.warn{background:var(--warn-bg);border-color:var(--warn-line);color:var(--warn-ink)}
 .pill.good{background:var(--good-bg);border-color:var(--good-line);color:var(--good-ink)}
 
+/* de plată pentru perioada */
+.card.plata{border-color:var(--accent);border-width:2px}
+.plata-rows{display:flex;flex-direction:column}
+.prow{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-rows:auto auto;gap:4px 14px;padding:10px 0;border-bottom:1px solid var(--line);align-items:start}
+.prow .name{font-weight:700;display:flex;align-items:center;gap:8px;font-size:15.5px;grid-column:1;grid-row:1}
+.prow .det{font-size:13.5px;color:var(--muted);display:flex;flex-direction:column;gap:3px;grid-column:1;grid-row:2;overflow-wrap:anywhere}
+.prow .det b{color:var(--ink);font-weight:600}
+.prow .cost{font-family:var(--f-display);font-weight:750;font-size:20px;text-align:right;white-space:nowrap;grid-column:2;grid-row:1 / span 2;align-self:center}
+.prow.total{border-bottom:0;padding-top:14px}
+.prow.total .name{font-size:17px}
+.prow.total .cost{font-size:clamp(24px,5vw,32px)}
+.plata-note{font-size:13.5px;color:var(--muted)}
+.plata-sel{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600}
+.plata-sel select{width:auto;padding:6px 10px}
+.tiles-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:6px 12px;padding:6px 2px 0}
+
 /* notices */
 .notice{border:1px solid var(--line);border-left-width:4px;border-radius:10px;padding:12px 14px;background:var(--surface);font-size:15px;display:flex;flex-direction:column;gap:6px}
 .notice.warn{background:var(--warn-bg);border-color:var(--warn-line)}
@@ -264,11 +280,21 @@ footer.foot{padding-top:26px;color:var(--muted);font-size:13.5px;max-width:70ch}
     <b>Cum pornești</b>
     <ol>
       <li><b>Tarife</b>: trece prețul pe kWh la electricitate și pe m³ la gaz și apă rece (cu TVA, așa cum reiese din factură).</li>
-      <li><b>Citiri</b>: introdu ultimele două citiri pe care le ai, fiecare cu data ei reală (poți alege date din trecut). Din a doua citire pagina calculează consumul și costul.</li>
+      <li><b>Citiri</b>: prima citire este cea de la mutare, cu <b>data mutării</b> pusă la „Data citirii”. A doua este cea de acum, cu data de azi. Cardul „De plată pentru perioada” arată apoi exact cât costă intervalul dintre ele.</li>
       <li><b>Alte cheltuieli de ansamblu</b>: completează sumele lunare din ianuarie până în august; media lor intră la întreținere.</li>
     </ol>
   </div>
 
+  <section class="card plata" id="plataCard">
+    <header>
+      <div><div class="kicker">De plată pentru perioada</div><h2 id="plataTitlu">—</h2></div>
+      <label class="plata-sel" for="plataSel">Perioada <select id="plataSel" aria-label="Alege perioada"></select></label>
+    </header>
+    <div class="plata-rows" id="plataBody"></div>
+    <p class="plata-note">Costul real al intervalului dintre două citiri, la tarifele de mai jos. Cardurile de sub acesta recalculează același consum pentru o lună întreagă de 30,44 zile.</p>
+  </section>
+
+  <div class="tiles-head"><span class="kicker">Estimare pentru o lună întreagă (30,44 zile)</span><span class="small muted" id="tilesBaza"></span></div>
   <section class="tiles" id="tiles" aria-label="Estimare lunară"></section>
 
   <div class="cols">
@@ -288,7 +314,7 @@ footer.foot{padding-top:26px;color:var(--muted);font-size:13.5px;max-width:70ch}
             <div class="field">
               <label for="data">Data citirii</label>
               <input type="date" id="data" required>
-              <div class="hint" id="dataHint">Data la care ai citit contorul</div>
+              <div class="hint" id="dataHint">Poți alege o dată din trecut, de exemplu ziua mutării</div>
             </div>
           </div>
           <div class="meter-fields" id="meterFields"></div>
@@ -401,6 +427,7 @@ var state = null;
 var editId = null;
 var perioadaTouched = false;
 var wipeArmed = null;
+var plataPer = null;
 
 function defaultState(){
   var ac = [];
@@ -569,6 +596,85 @@ function rowCosts(){
   return map;
 }
 
+/* ---------- de plată pentru perioada ---------- */
+function perioadeDisponibile(){
+  var seen = {}, out = [];
+  state.citiri.forEach(function(c){ if (!seen[c.perioada]) { seen[c.perioada] = true; out.push(c.perioada); } });
+  return out.sort().reverse();
+}
+function calculPerioada(per){
+  var out = { per:per, meters:{}, from:null, to:null };
+  METERS.forEach(function(m){
+    var s = seriesFor(m.id), end = null, idx = -1;
+    for (var i = s.length - 1; i >= 0; i--) if (s[i].perioada === per) { end = s[i]; idx = i; break; }
+    if (!end) { out.meters[m.id] = { status:'fara' }; return; }
+    if (idx === 0) { out.meters[m.id] = { status:'prima', end:end }; return; }
+    var start = s[idx-1], consum = end[m.id] - start[m.id], zile = daysBetween(start.data, end.data), pret = pretUnitar(m.id);
+    out.meters[m.id] = { status:'ok', start:start, end:end, consum:consum, zile:zile, pret:pret, cost:pret == null ? null : consum * pret };
+    if (!out.from || start.data < out.from) out.from = start.data;
+    if (!out.to || end.data > out.to) out.to = end.data;
+  });
+  var suma = null;
+  state.alteCheltuieli.forEach(function(a){ if (a.luna === per && typeof a.suma === 'number') suma = a.suma; });
+  var ma = mediaAlte();
+  out.alte = suma != null ? suma : ma.media; out.alteEst = suma == null; out.alteN = ma.n;
+  var apa = out.meters.apa, apaOk = apa.status === 'ok' && apa.cost != null;
+  out.intr = null; out.lipsIntr = [];
+  if (apaOk || out.alte != null) out.intr = (apaOk ? apa.cost : 0) + (out.alte || 0);
+  if (!apaOk) out.lipsIntr.push(apa.status === 'ok' ? 'tarif apă' : 'citire apă');
+  if (out.alte == null) out.lipsIntr.push('alte cheltuieli');
+  out.total = null; out.lips = [];
+  ['el','gaz'].forEach(function(id){
+    var e = out.meters[id], nume = id === 'el' ? 'electricitate' : 'gaz';
+    if (e.status === 'ok' && e.cost != null) out.total = (out.total || 0) + e.cost;
+    else out.lips.push((e.status === 'ok' ? 'tarif ' : 'citire ') + nume);
+  });
+  if (out.intr != null) out.total = (out.total || 0) + out.intr;
+  out.lips = out.lips.concat(out.lipsIntr);
+  return out;
+}
+function meterDet(m, e){
+  if (e.status === 'fara') return '<b>fără citire în această perioadă</b>';
+  if (e.status === 'prima') return 'prima citire <span class="lcd">' + num(e.end[m.id], m.dec) + '</span> ' + fmtData(e.end.data) + ', <b>fără interval încă</b>';
+  var t = '<span class="lcd">' + num(e.start[m.id], m.dec) + '</span> ' + fmtData(e.start.data) + ' → <span class="lcd">' + num(e.end[m.id], m.dec) + '</span> ' + fmtData(e.end.data) +
+          ' · <b>' + num(e.consum, m.dec) + ' ' + m.unit + '</b> în ' + e.zile + ' zile';
+  t += e.pret != null ? ' × ' + num(e.pret, 4) + ' lei/' + m.unit + ' = <b>' + lei(e.cost) + '</b>' : ' · <b>tarif necompletat</b>';
+  return t;
+}
+function meterDetText(m, e){
+  if (e.status === 'fara') return 'fără citire în această perioadă';
+  if (e.status === 'prima') return 'prima citire ' + num(e.end[m.id], m.dec) + ' ' + m.unit + ' (' + fmtData(e.end.data) + '), fără interval încă';
+  var t = num(e.start[m.id], m.dec) + ' (' + fmtData(e.start.data) + ') → ' + num(e.end[m.id], m.dec) + ' (' + fmtData(e.end.data) + ') = ' + num(e.consum, m.dec) + ' ' + m.unit + ' în ' + e.zile + ' zile';
+  t += e.pret != null ? ' × ' + num(e.pret, 4) + ' lei/' + m.unit + ' = ' + lei(e.cost) : ', tarif necompletat';
+  return t;
+}
+function prow(m, e, dotCls){
+  return '<div class="prow"><div class="name"><span class="dot ' + dotCls + '"></span>' + m.nume + '</div><div class="det"><span>' + meterDet(m, e) + '</span></div><div class="cost">' + (e.status === 'ok' && e.cost != null ? lei(e.cost) : '—') + '</div></div>';
+}
+function renderPlata(){
+  var pers = perioadeDisponibile(), sel = $('plataSel');
+  if (!pers.length) {
+    sel.innerHTML = '<option>—</option>'; sel.disabled = true;
+    $('plataTitlu').textContent = 'Nicio citire încă';
+    $('plataBody').innerHTML = '<div class="empty">Introdu citirea de la mutare, cu data ei, apoi citirea de acum. Aici vei vedea cât ai de plată pentru intervalul dintre ele.</div>';
+    return;
+  }
+  sel.disabled = false;
+  if (!plataPer || pers.indexOf(plataPer) < 0) plataPer = pers[0];
+  sel.innerHTML = pers.map(function(p){ return '<option value="' + p + '"' + (p === plataPer ? ' selected' : '') + '>' + fmtPerioada(p) + '</option>'; }).join('');
+  var c = calculPerioada(plataPer);
+  $('plataTitlu').textContent = fmtPerioada(plataPer) + (c.from && c.to ? ' · ' + fmtData(c.from) + ' → ' + fmtData(c.to) + ' (' + daysBetween(c.from, c.to) + ' zile)' : '');
+  var h = prow(meter('el'), c.meters.el, 'd-el') + prow(meter('gaz'), c.meters.gaz, 'd-gaz');
+  var det = '<span>Apă rece: ' + meterDet(meter('apa'), c.meters.apa) + '</span>';
+  det += '<span>Alte cheltuieli de ansamblu: <b>' + (c.alte != null ? lei(c.alte) : 'necompletate') + '</b>' +
+         (c.alte == null ? '' : c.alteEst ? ' (medie a ' + c.alteN + (c.alteN === 1 ? ' lună' : ' luni') + '; suma pentru ' + fmtPerioada(plataPer) + ' nu e completată încă)' : ' (suma lunii ' + fmtPerioada(plataPer) + ')') + '</span>';
+  h += '<div class="prow"><div class="name"><span class="dot d-intr"></span>Întreținere</div><div class="det">' + det + '</div><div class="cost">' + (c.intr != null ? lei(c.intr) : '—') + '</div></div>';
+  h += '<div class="prow total"><div class="name">Total de plată</div><div class="det">' +
+       (c.lips.length ? '<span><span class="pill warn">incomplet: lipsește ' + esc(c.lips.join(', ')) + '</span></span>' : '<span><span class="pill good">electricitate + gaz + întreținere</span></span>') +
+       '</div><div class="cost">' + (c.total != null ? lei(c.total) : '—') + '</div></div>';
+  $('plataBody').innerHTML = h;
+}
+
 /* ---------- randare: tiles ---------- */
 function renderTiles(){
   var c = calcul();
@@ -593,6 +699,7 @@ function renderTiles(){
   h += '<div class="tile t-total"><div class="kicker">Total estimat / lună</div><div class="val">' + (c.total != null ? lei(c.total) : '—') + '</div><div class="sub">' + tsub + '</div></div>';
   $('tiles').innerHTML = h;
   $('perioadaCurenta').textContent = fmtPerioada(perioadaCurenta());
+  $('tilesBaza').textContent = 'Bază: ' + (state.bazaCalcul === 'ultimele3' ? 'ultimele 3 citiri' : 'ultima perioadă');
   setHidden('onboarding', state.citiri.length >= 2);
 }
 function tile(cls, nume, e, m, pt){
@@ -698,6 +805,7 @@ function onSubmit(ev){
   if (editId) {
     state.citiri = state.citiri.map(function(c){ return c.id === editId ? rec : c; });
   } else state.citiri.push(rec);
+  plataPer = rec.perioada;
   save();
   var wasEdit = !!editId;
   resetForm();
@@ -985,6 +1093,16 @@ function rezumatText(){
   var c = calcul(), L = [];
   L.push('Evidență apartament · ' + fmtPerioada(perioadaCurenta()));
   L.push('');
+  var pers = perioadeDisponibile();
+  if (pers.length) {
+    var per = (plataPer && pers.indexOf(plataPer) >= 0) ? plataPer : pers[0], cp = calculPerioada(per);
+    L.push('DE PLATĂ pentru ' + fmtPerioada(per) + (cp.from && cp.to ? ' (' + fmtData(cp.from) + ' → ' + fmtData(cp.to) + ', ' + daysBetween(cp.from, cp.to) + ' zile)' : '') + ':');
+    METERS.forEach(function(m){ L.push('  ' + m.nume + ': ' + meterDetText(m, cp.meters[m.id])); });
+    L.push('  Alte cheltuieli de ansamblu: ' + (cp.alte != null ? lei(cp.alte) + (cp.alteEst ? ' (medie)' : '') : '—'));
+    L.push('  Întreținere (apă rece + alte cheltuieli): ' + lei(cp.intr));
+    L.push('  TOTAL DE PLATĂ: ' + lei(cp.total) + (cp.lips.length ? ' (incomplet: lipsește ' + cp.lips.join(', ') + ')' : ''));
+    L.push('');
+  }
   L.push('Ultimele indexuri:');
   METERS.forEach(function(m){
     var last = seriesFor(m.id).slice(-1)[0];
@@ -1055,7 +1173,7 @@ function cycleTheme(){
 
 /* ---------- orchestrare ---------- */
 function renderDerived(){
-  renderTiles(); renderMedia(); renderIstoric(); renderChart(); updateLive();
+  renderPlata(); renderTiles(); renderMedia(); renderIstoric(); renderChart(); updateLive();
   $('rezumatText').value = rezumatText();
   $('bazaUltima').setAttribute('aria-pressed', state.bazaCalcul === 'ultima' ? 'true' : 'false');
   $('bazaTrei').setAttribute('aria-pressed', state.bazaCalcul === 'ultimele3' ? 'true' : 'false');
@@ -1074,6 +1192,7 @@ function init(){
   $('bazaUltima').addEventListener('click', function(){ state.bazaCalcul = 'ultima'; save(); renderDerived(); });
   $('bazaTrei').addEventListener('click', function(){ state.bazaCalcul = 'ultimele3'; save(); renderDerived(); });
   $('themeBtn').addEventListener('click', cycleTheme);
+  $('plataSel').addEventListener('change', function(){ plataPer = this.value; renderPlata(); $('rezumatText').value = rezumatText(); });
   $('exportBtn').addEventListener('click', exportJSON);
   $('importBtn').addEventListener('click', function(){ $('importFile').click(); });
   $('importFile').addEventListener('change', function(){ if (this.files && this.files[0]) importJSON(this.files[0]); this.value = ''; });
