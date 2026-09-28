@@ -54,6 +54,7 @@
 [hidden]{display:none!important}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:16px;line-height:1.5}
+body.is-loading .card,body.is-loading .tiles,body.is-loading .toolbar{opacity:.55;pointer-events:none}
 .page{max-width:1080px;margin:0 auto;padding-inline:16px;padding-block:0 56px}
 h1,h2,h3{font-family:var(--f-display);line-height:1.15;margin:0;text-wrap:balance}
 h1{font-size:clamp(28px,5.5vw,42px);font-weight:750;letter-spacing:-.01em}
@@ -271,6 +272,14 @@ footer.foot{padding-top:26px;color:var(--muted);font-size:13.5px;max-width:70ch}
 </div>
 
 <div class="stack">
+  <div class="notice" id="loadingNotice" hidden>
+    <b>Se încarcă datele din contul tău…</b>
+    <span>Pagina publicată își ține citirile în baza de date a contului tău Claude, aceleași pe telefon și pe calculator.</span>
+  </div>
+  <div class="notice danger" id="dbWarn" hidden>
+    <b>Salvarea în baza de date nu a reușit.</b>
+    <span id="dbWarnText">Modificările rămân în această pagină și se reîncearcă la următoarea salvare.</span>
+  </div>
   <div class="notice danger" id="storageWarn" hidden>
     <b>Datele nu pot fi salvate în acest browser.</b>
     <span>Memoria locală este blocată sau plină (fereastră privată, date de site blocate). Pagina merge, dar citirile dispar la închidere. Folosește „Exportă JSON” ca să le păstrezi.</span>
@@ -409,6 +418,13 @@ footer.foot{padding-top:26px;color:var(--muted);font-size:13.5px;max-width:70ch}
         <textarea id="rezumatText" readonly aria-label="Rezumat text"></textarea>
       </div>
     </details>
+    <details class="helper" id="jsonBox">
+      <summary>Vezi datele ca text JSON</summary>
+      <div class="body" style="grid-template-columns:1fr">
+        <textarea id="jsonText" readonly aria-label="Date JSON"></textarea>
+        <div class="actions"><button type="button" class="btn sm" id="copyJsonBtn">Copiază JSON</button></div>
+      </div>
+    </details>
   </section>
 
   <footer class="foot">
@@ -495,16 +511,76 @@ function numOrNull(v){ return (typeof v === 'number' && isFinite(v)) ? v : null;
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
 function pad(n){ return (n < 10 ? '0' : '') + n; }
 
-function load(){
+/* Stocare: în pagina publicată pe claude.ai datele stau în baza de date a paginii (aceleași pe orice
+   dispozitiv); deschisă ca fișier local, pagina folosește memoria browserului. */
+var DB_PATH = 'evidenta/stare';
+var store = { mode:'local', ref:null, downloads:null, writing:false, pending:null, lastWritten:'', retried:false };
+function hasClaude(){ return typeof window !== 'undefined' && window.claude && typeof window.claude.use === 'function'; }
+function normalizat(x){ return JSON.stringify(migrate(x)); }
+function loadLocal(){
   try {
     var raw = localStorage.getItem(KEY);
     if (!raw) return defaultState();
     return migrate(JSON.parse(raw));
   } catch (e) { return defaultState(); }
 }
-function save(){
+function saveLocal(){
   try { localStorage.setItem(KEY, JSON.stringify(state)); setHidden('storageWarn', true); }
   catch (e) { setHidden('storageWarn', false); }
+}
+function save(){
+  if (store.mode === 'db') queueDbWrite();
+  else if (store.mode === 'local') saveLocal();
+}
+function queueDbWrite(){
+  var json = normalizat(state);
+  if (json === store.lastWritten && !store.pending) return;
+  store.pending = json;
+  if (!store.writing) flushDb();
+}
+function flushDb(){
+  if (!store.pending) { store.writing = false; return; }
+  var json = store.pending; store.pending = null; store.writing = true;
+  store.ref.set(JSON.parse(json)).then(function(){
+    store.lastWritten = json; store.retried = false; setHidden('dbWarn', true); flushDb();
+  }, function(e){
+    store.writing = false;
+    if (!store.pending) store.pending = json;
+    var code = e && e.code ? e.code : 'unavailable';
+    if (code === 'unavailable' && !store.retried) { store.retried = true; setTimeout(flushDb, 700 + Math.floor(Math.random() * 800)); return; }
+    $('dbWarnText').textContent = 'Cod: ' + code + '. Modificările rămân în această pagină și se reîncearcă la următoarea salvare.';
+    setHidden('dbWarn', false);
+  });
+}
+function subscribeDb(){
+  store.ref.onSnapshot(function(snap){
+    if (!snap.exists || snap.metadata.hasPendingWrites) return;
+    var json = normalizat(snap.data());
+    if (json === store.lastWritten || json === normalizat(state)) return;
+    state = JSON.parse(json); store.lastWritten = json;
+    rebuildAll(); renderSeedNotice(); toast('Date actualizate de pe alt dispozitiv');
+  }, function(){ /* abonarea s-a încheiat; pagina continuă cu ce are */ });
+}
+function finishLoading(){ document.body.classList.remove('is-loading'); setHidden('loadingNotice', true); }
+function startStorage(){
+  if (!hasClaude()) { store.mode = 'local'; state = loadLocal(); return Promise.resolve(); }
+  store.mode = 'loading'; state = defaultState();
+  document.body.classList.add('is-loading'); setHidden('loadingNotice', false);
+  window.claude.use('downloads').then(function(d){ store.downloads = d || null; }, function(){ store.downloads = null; });
+  return window.claude.use('db').then(function(db){
+    if (!db) { store.mode = 'local'; state = loadLocal(); return; }
+    store.ref = db.doc(DB_PATH);
+    return store.ref.get().then(function(snap){
+      store.mode = 'db';
+      if (snap.exists) { state = migrate(snap.data()); store.lastWritten = normalizat(state); }
+      else { state = defaultState(); store.lastWritten = ''; queueDbWrite(); }
+      subscribeDb();
+    });
+  }).catch(function(e){
+    store.mode = 'local'; state = loadLocal();
+    $('dbWarnText').textContent = 'Cod: ' + (e && e.code ? e.code : 'unavailable') + '. Pagina folosește memoria acestui browser până la o reîncărcare reușită.';
+    setHidden('dbWarn', false);
+  });
 }
 
 /* ---------- utilitare ---------- */
@@ -1191,13 +1267,32 @@ function copyRezumat(){
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(done, fail);
   else fail();
 }
+function showJsonText(json){
+  $('jsonText').value = json; $('jsonBox').open = true; $('jsonText').focus(); $('jsonText').select();
+}
 function exportJSON(){
-  var blob = new Blob([JSON.stringify(state, null, 2)], { type:'application/json' });
+  var json = JSON.stringify(state, null, 2), name = 'evidenta-apartament-' + todayISO() + '.json';
+  $('jsonText').value = json;
+  if (store.downloads) {
+    store.downloads.save({ filename:name, data:json }).then(function(){ toast('Fișier JSON salvat'); }, function(e){
+      if (e && e.code === 'declined') return;
+      showJsonText(json); toast('Salvarea nu e disponibilă aici. Copiază textul JSON.');
+    });
+    return;
+  }
+  if (hasClaude()) { showJsonText(json); toast('Copiază textul JSON și păstrează-l ca backup'); return; }
+  var blob = new Blob([json], { type:'application/json' });
   var a = document.createElement('a'); a.href = URL.createObjectURL(blob);
-  a.download = 'evidenta-apartament-' + todayISO() + '.json';
+  a.download = name;
   document.body.appendChild(a); a.click();
   setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
   toast('Fișier JSON exportat');
+}
+function copyJson(){
+  var json = JSON.stringify(state, null, 2); $('jsonText').value = json;
+  var fail = function(){ showJsonText(json); toast('Selectează textul și copiază-l manual'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(json).then(function(){ toast('JSON copiat'); }, fail);
+  else fail();
 }
 function importJSON(file){
   var fr = new FileReader();
@@ -1206,7 +1301,7 @@ function importJSON(file){
       var obj = JSON.parse(fr.result);
       if (!obj || typeof obj !== 'object' || !('citiri' in obj)) throw new Error('format');
       state = migrate(obj);
-      save(); rebuildAll(); toast('Date importate: ' + state.citiri.length + ' citiri');
+      save(); rebuildAll(); renderSeedNotice(); toast('Date importate: ' + state.citiri.length + ' citiri');
     } catch (e) { toast('Fișierul nu este un export valid al acestei pagini'); }
   };
   fr.readAsText(file);
@@ -1277,8 +1372,8 @@ function rebuildAll(){
   $('tarife').innerHTML = ''; buildTarife(); buildAlte(); resetForm(); renderDerived();
 }
 function init(){
-  state = load();
   try { applyTheme(localStorage.getItem(THEME_KEY) || 'auto'); } catch (e) { applyTheme('auto'); }
+  state = defaultState();
   buildForm(); buildTarife(); buildAlte();
   $('alteList').addEventListener('change', onAlteChange);
   $('alteList').addEventListener('click', onAlteClick);
@@ -1295,10 +1390,13 @@ function init(){
   $('importBtn').addEventListener('click', function(){ $('importFile').click(); });
   $('importFile').addEventListener('change', function(){ if (this.files && this.files[0]) importJSON(this.files[0]); this.value = ''; });
   $('copyBtn').addEventListener('click', copyRezumat);
+  $('copyJsonBtn').addEventListener('click', copyJson);
   $('wipeBtn').addEventListener('click', wipeAll);
-  save();
   renderDerived();
-  renderSeedNotice();
+  startStorage().then(function(){
+    rebuildAll(); renderSeedNotice(); finishLoading();
+    if (store.mode === 'local') save();
+  });
 }
 init();
 })();
