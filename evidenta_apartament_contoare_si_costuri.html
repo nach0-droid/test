@@ -150,6 +150,7 @@ input.num{font-family:var(--f-mono);font-variant-numeric:tabular-nums;font-size:
 .meter.m-gaz{--m-c:var(--s-gaz)}
 .meter.m-apa{--m-c:var(--s-intr)}
 .meter .top{display:flex;justify-content:space-between;gap:8px;align-items:baseline;flex-wrap:wrap}
+.serie{font-family:var(--f-mono);font-size:12.5px;color:var(--muted);font-weight:500;overflow-wrap:anywhere}
 .meter .prev{font-size:13px;color:var(--muted)}
 .meter .live{font-size:13.5px;color:var(--muted);min-height:1.3em}
 .meter .live b{color:var(--ink);font-weight:600}
@@ -469,6 +470,7 @@ function defaultState(){
     tarife:{ el:{ pret:null, abonamentZi:null }, gaz:{ pret:null, pretPe:'m3', factorKwhPerM3:null, abonamentZi:null }, apa:{ pret:null, abonamentZi:null } },
     bazaCalcul:'ultima',
     alteEstimare:null,
+    contoare:{ el:{ serie:'' }, gaz:{ serie:'' }, apa:{ serie:'' } },
     citiri:[],
     alteCheltuieli:lunileInitiale()
   };
@@ -500,8 +502,14 @@ function migrate(s){
   });
   else out.alteCheltuieli = d.alteCheltuieli;
   out.seedNoticeDismissed = s.seedNoticeDismissed === true;
+  out.contoare = {};
+  METERS.forEach(function(m){
+    var c = s.contoare && s.contoare[m.id];
+    out.contoare[m.id] = { serie:(c && typeof c.serie === 'string') ? c.serie.trim().slice(0, 60) : '' };
+  });
   return out;
 }
+function serieDe(id){ return (state && state.contoare && state.contoare[id] && state.contoare[id].serie) || ''; }
 function numOrNull(v){ return (typeof v === 'number' && isFinite(v)) ? v : null; }
 var ID_OK = /^[A-Za-z0-9_\-.~:@+]{1,200}$/;
 /* o citire normalizată (sau null dacă nu e validă); id-ul respectă gramatica documentelor din baza de date */
@@ -528,7 +536,7 @@ var store = {
 };
 function hasClaude(){ return typeof window !== 'undefined' && window.claude && typeof window.claude.use === 'function'; }
 function setariDin(m){
-  return { version:1, tarife:m.tarife, bazaCalcul:m.bazaCalcul, alteEstimare:m.alteEstimare, alteCheltuieli:m.alteCheltuieli, seedNoticeDismissed:!!m.seedNoticeDismissed };
+  return { version:1, tarife:m.tarife, bazaCalcul:m.bazaCalcul, alteEstimare:m.alteEstimare, alteCheltuieli:m.alteCheltuieli, contoare:m.contoare, seedNoticeDismissed:!!m.seedNoticeDismissed };
 }
 function delayRand(){ return 700 + Math.floor(Math.random() * 800); }
 function retryOnce(fn){
@@ -612,7 +620,7 @@ function pump(){
 function applySetariRemote(obj){
   var m = migrate(Object.assign({}, obj, { citiri:state.citiri }));
   state.tarife = m.tarife; state.bazaCalcul = m.bazaCalcul; state.alteEstimare = m.alteEstimare;
-  state.alteCheltuieli = m.alteCheltuieli; state.seedNoticeDismissed = m.seedNoticeDismissed;
+  state.alteCheltuieli = m.alteCheltuieli; state.seedNoticeDismissed = m.seedNoticeDismissed; state.contoare = m.contoare;
 }
 function docToCitire(d){
   var data = d.data(); if (!data) return null;
@@ -877,7 +885,8 @@ function meterDetText(m, e){
   return t + ' × ' + num(e.pret, 4) + ' lei/' + m.unit + ' = ' + lei(e.cost);
 }
 function prow(m, e, dotCls){
-  return '<div class="prow"><div class="name"><span class="dot ' + dotCls + '"></span>' + m.nume + '</div><div class="det"><span>' + meterDet(m, e) + '</span></div><div class="cost">' + (e.status === 'ok' && e.cost != null ? lei(e.cost) : '—') + '</div></div>';
+  var se = serieDe(m.id);
+  return '<div class="prow"><div class="name"><span class="dot ' + dotCls + '"></span>' + m.nume + (se ? ' <span class="serie">contor ' + esc(se) + '</span>' : '') + '</div><div class="det"><span>' + meterDet(m, e) + '</span></div><div class="cost">' + (e.status === 'ok' && e.cost != null ? lei(e.cost) : '—') + '</div></div>';
 }
 function renderPlata(){
   var pers = perioadeDisponibile(), sel = $('plataSel');
@@ -893,7 +902,8 @@ function renderPlata(){
   var c = calculPerioada(plataPer);
   $('plataTitlu').textContent = fmtPerioada(plataPer) + (c.from && c.to ? ' · ' + fmtData(c.from) + ' → ' + fmtData(c.to) + ' (' + daysBetween(c.from, c.to) + ' zile)' : '');
   var h = prow(meter('el'), c.meters.el, 'd-el') + prow(meter('gaz'), c.meters.gaz, 'd-gaz');
-  var det = '<span>Apă rece: ' + meterDet(meter('apa'), c.meters.apa) + '</span>';
+  var seA = serieDe('apa');
+  var det = '<span>Apă rece' + (seA ? ' <span class="serie">contor ' + esc(seA) + '</span>' : '') + ': ' + meterDet(meter('apa'), c.meters.apa) + '</span>';
   det += '<span>Alte cheltuieli de ansamblu: <b>' + (c.alte != null ? lei(c.alte) : 'necompletate') + '</b>' +
          (c.alte == null ? '' : c.alteEst ? ' (' + sursaAlte({ sursa:c.alteSursa, n:c.alteN }) + '; suma pentru ' + fmtPerioada(plataPer) + ' nu e completată încă)' : ' (suma lunii ' + fmtPerioada(plataPer) + ')') + '</span>';
   h += '<div class="prow"><div class="name"><span class="dot d-intr"></span>Întreținere</div><div class="det">' + det + '</div><div class="cost">' + (c.intr != null ? lei(c.intr) : '—') + '</div></div>';
@@ -955,6 +965,7 @@ function buildForm(){
   METERS.forEach(function(m){
     h += '<div class="meter m-' + m.cls + '">' +
       '<div class="top"><label class="lbl" for="in_' + m.id + '">' + m.nume + '</label><span class="prev" id="prev_' + m.id + '"></span></div>' +
+      '<div class="serie" id="serie_' + m.id + '" hidden></div>' +
       '<div class="unitwrap"><input class="num" type="text" inputmode="decimal" autocomplete="off" id="in_' + m.id + '" placeholder="index de pe contor"><span class="unit">' + m.unit + '</span></div>' +
       '<div class="live" id="live_' + m.id + '"></div></div>';
   });
@@ -1083,6 +1094,15 @@ function buildTarife(){
   h += tarifBlock('apa', 'Apă rece', 'lei/m³', 'd-intr');
   $('tarife').innerHTML = h;
   METERS.forEach(function(m){
+    var si = $('serie_in_' + m.id);
+    si.value = serieDe(m.id);
+    si.addEventListener('change', function(){
+      var v = si.value.trim().slice(0, 60);
+      si.value = v;
+      if (v === serieDe(m.id)) return;
+      state.contoare[m.id] = { serie:v };
+      save(); renderDerived();
+    });
     var inp = $('pret_' + m.id);
     inp.value = state.tarife[m.id].pret == null ? '' : String(state.tarife[m.id].pret).replace('.', ',');
     inp.addEventListener('change', function(){
@@ -1144,7 +1164,9 @@ function tarifBlock(id, nume, unitLabel, dotCls){
   var isGaz = id === 'gaz';
   var h = '<div class="tarif"><div class="head"><h3><span class="dot ' + dotCls + '"></span>' + nume + '</h3>' +
     (isGaz ? '<label class="small muted" style="display:flex;gap:6px;align-items:center">Prețul e pe <select id="gazPretPe" style="width:auto;padding:4px 8px"><option value="m3">m³</option><option value="kwh">kWh</option></select></label>' : '') +
-    '</div><div class="grid2">' +
+    '</div>' +
+    '<div class="field"><label for="serie_in_' + id + '">Serie contor <span class="muted" style="font-weight:400">(opțional)</span></label><input type="text" id="serie_in_' + id + '" maxlength="60" autocomplete="off" spellcheck="false" placeholder="de pe contor sau de pe factură"></div>' +
+    '<div class="grid2">' +
     '<div class="field"><label for="pret_' + id + '">Preț <span class="muted" id="u_' + id + '" style="font-weight:400">' + (unitLabel || 'lei/m³') + '</span></label><input class="num" type="text" inputmode="decimal" id="pret_' + id + '" placeholder="ex. 1,25"></div>' +
     (isGaz ? '<div class="field" id="gazFactorWrap"><label for="gazFactor">Factor conversie <span class="muted" style="font-weight:400">kWh/m³</span></label><input class="num" type="text" inputmode="decimal" id="gazFactor" placeholder="PCS de pe factură, ex. 10,461"></div>' : '') +
     (id === 'apa'
@@ -1369,7 +1391,8 @@ function rezumatText(){
   L.push('Ultimele indexuri:');
   METERS.forEach(function(m){
     var last = seriesFor(m.id).slice(-1)[0];
-    L.push('  ' + m.nume + ': ' + (last ? num(last[m.id], m.dec) + ' ' + m.unit + ' (' + fmtData(last.data) + ')' : '—'));
+    var se = serieDe(m.id);
+    L.push('  ' + m.nume + (se ? ' (contor ' + se + ')' : '') + ': ' + (last ? num(last[m.id], m.dec) + ' ' + m.unit + ' (' + fmtData(last.data) + ')' : '—'));
   });
   L.push('');
   L.push('Estimare lunară (' + (state.bazaCalcul === 'ultimele3' ? 'ultimele 3 citiri' : 'ultima perioadă') + '):');
@@ -1483,9 +1506,17 @@ function cycleTheme(){
   applyTheme(next);
 }
 
+function renderSerii(){
+  METERS.forEach(function(m){
+    var el = $('serie_' + m.id); if (!el) return;
+    var se = serieDe(m.id);
+    el.textContent = se ? 'seria ' + se : ''; el.hidden = !se;
+  });
+}
+
 /* ---------- orchestrare ---------- */
 function renderDerived(){
-  renderPlata(); renderTiles(); renderMedia(); renderIstoric(); renderChart(); updateLive();
+  renderPlata(); renderTiles(); renderMedia(); renderIstoric(); renderChart(); updateLive(); renderSerii();
   $('rezumatText').value = rezumatText();
   $('bazaUltima').setAttribute('aria-pressed', state.bazaCalcul === 'ultima' ? 'true' : 'false');
   $('bazaTrei').setAttribute('aria-pressed', state.bazaCalcul === 'ultimele3' ? 'true' : 'false');
