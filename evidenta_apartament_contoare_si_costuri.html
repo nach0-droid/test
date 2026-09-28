@@ -493,12 +493,7 @@ function migrate(s){
     citiri:[],
     alteCheltuieli:[]
   };
-  if (Array.isArray(s.citiri)) s.citiri.forEach(function(c){
-    if (!c || typeof c.data !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(c.data)) return;
-    var r = { id:String(c.id || uid()), perioada:(typeof c.perioada === 'string' && /^\d{4}-\d{2}$/.test(c.perioada)) ? c.perioada : c.data.slice(0,7), data:c.data, nota:typeof c.nota === 'string' ? c.nota : '' };
-    METERS.forEach(function(m){ var v = numOrNull(c[m.id]); if (v != null) r[m.id] = v; });
-    out.citiri.push(r);
-  });
+  if (Array.isArray(s.citiri)) s.citiri.forEach(function(c){ var r = normCitire(c); if (r) out.citiri.push(r); });
   if (Array.isArray(s.alteCheltuieli) && s.alteCheltuieli.length) s.alteCheltuieli.forEach(function(a){
     if (!a || typeof a.luna !== 'string' || !/^\d{4}-\d{2}$/.test(a.luna)) return;
     out.alteCheltuieli.push({ luna:a.luna, suma:numOrNull(a.suma), inclus:a.inclus !== false });
@@ -508,15 +503,43 @@ function migrate(s){
   return out;
 }
 function numOrNull(v){ return (typeof v === 'number' && isFinite(v)) ? v : null; }
+var ID_OK = /^[A-Za-z0-9_\-.~:@+]{1,200}$/;
+/* o citire normalizată (sau null dacă nu e validă); id-ul respectă gramatica documentelor din baza de date */
+function normCitire(c){
+  if (!c || typeof c.data !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(c.data)) return null;
+  var id = (typeof c.id === 'string' && ID_OK.test(c.id) && c.id !== '.' && c.id !== '..') ? c.id : uid();
+  var r = { id:id, perioada:(typeof c.perioada === 'string' && /^\d{4}-\d{2}$/.test(c.perioada)) ? c.perioada : c.data.slice(0,7), data:c.data, nota:typeof c.nota === 'string' ? c.nota : '' };
+  var any = false;
+  METERS.forEach(function(m){ var v = numOrNull(c[m.id]); if (v != null) { r[m.id] = v; any = true; } });
+  return any ? r : null;
+}
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
 function pad(n){ return (n < 10 ? '0' : '') + n; }
 
-/* Stocare: în pagina publicată pe claude.ai datele stau în baza de date a paginii (aceleași pe orice
-   dispozitiv); deschisă ca fișier local, pagina folosește memoria browserului. */
-var DB_PATH = 'evidenta/stare';
-var store = { mode:'local', ref:null, downloads:null, writing:false, pending:null, lastWritten:'', retried:false };
+/* Stocare. Deschisă ca fișier local, pagina ține totul în memoria browserului (o singură cheie JSON).
+   Publicată pe claude.ai, ține datele în baza de date a paginii: setările într-un document
+   (evidenta/setari) și fiecare citire în propriul document (citiri/<id>), ca adăugările făcute de pe
+   telefon și de pe calculator să nu se suprascrie. Scrierile trec printr-o coadă strict serială. */
+var DB_SETARI = 'evidenta/setari', DB_CITIRI = 'citiri';
+var store = {
+  mode:'local', db:null, setariRef:null, citiriRef:null, downloads:null,
+  queue:{}, order:[], busy:false, inflight:null, retried:false,
+  last:{ setari:'', citiri:{} }, dirtyDuringLoad:false, resubs:0, unsubs:[]
+};
 function hasClaude(){ return typeof window !== 'undefined' && window.claude && typeof window.claude.use === 'function'; }
-function normalizat(x){ return JSON.stringify(migrate(x)); }
+function setariDin(m){
+  return { version:1, tarife:m.tarife, bazaCalcul:m.bazaCalcul, alteEstimare:m.alteEstimare, alteCheltuieli:m.alteCheltuieli, seedNoticeDismissed:!!m.seedNoticeDismissed };
+}
+function delayRand(){ return 700 + Math.floor(Math.random() * 800); }
+function retryOnce(fn){
+  return fn().catch(function(e){
+    if (!(e && e.code === 'unavailable')) throw e;
+    return new Promise(function(res){ setTimeout(res, delayRand()); }).then(fn);
+  });
+}
+function dbWarn(text){ $('dbWarnText').textContent = text; setHidden('dbWarn', false); }
+
+/* --- memoria browserului --- */
 function loadLocal(){
   try {
     var raw = localStorage.getItem(KEY);
@@ -528,58 +551,157 @@ function saveLocal(){
   try { localStorage.setItem(KEY, JSON.stringify(state)); setHidden('storageWarn', true); }
   catch (e) { setHidden('storageWarn', false); }
 }
+
+/* --- punctul unic de salvare --- */
 function save(){
-  if (store.mode === 'db') queueDbWrite();
+  if (store.mode === 'db') saveDb();
   else if (store.mode === 'local') saveLocal();
+  else store.dirtyDuringLoad = true;
 }
-function queueDbWrite(){
-  var json = normalizat(state);
-  if (json === store.lastWritten && !store.pending) return;
-  store.pending = json;
-  if (!store.writing) flushDb();
+
+/* --- baza de date: planificare + coadă serială --- */
+function enqueue(path, op, body){
+  store.queue[path] = { op:op, body:body };
+  if (store.order.indexOf(path) < 0) store.order.push(path);
 }
-function flushDb(){
-  if (!store.pending) { store.writing = false; return; }
-  var json = store.pending; store.pending = null; store.writing = true;
-  store.ref.set(JSON.parse(json)).then(function(){
-    store.lastWritten = json; store.retried = false; setHidden('dbWarn', true); flushDb();
+function pendingFor(path){ return store.inflight === path || !!store.queue[path]; }
+function planWrites(){
+  var m = migrate(state);
+  var sj = JSON.stringify(setariDin(m));
+  if (sj !== store.last.setari) enqueue(DB_SETARI, 'set', JSON.parse(sj));
+  var seen = {};
+  m.citiri.forEach(function(c){
+    var j = JSON.stringify(c); seen[c.id] = true;
+    if (store.last.citiri[c.id] !== j) enqueue(DB_CITIRI + '/' + c.id, 'set', JSON.parse(j));
+  });
+  Object.keys(store.last.citiri).forEach(function(id){ if (!seen[id]) enqueue(DB_CITIRI + '/' + id, 'delete', null); });
+}
+function saveDb(){ planWrites(); store.retried = false; pump(); }
+function pump(){
+  if (store.busy) return;
+  var path = store.order.shift();
+  if (!path) return;
+  var w = store.queue[path]; delete store.queue[path];
+  store.busy = true; store.inflight = path;
+  var ref = store.db.doc(path);
+  var p = w.op === 'delete' ? ref.delete() : ref.set(w.body);
+  p.then(function(){
+    if (path === DB_SETARI) store.last.setari = JSON.stringify(w.body);
+    else {
+      var id = path.slice(DB_CITIRI.length + 1);
+      if (w.op === 'delete') delete store.last.citiri[id]; else store.last.citiri[id] = JSON.stringify(w.body);
+    }
+    store.busy = false; store.inflight = null; store.retried = false;
+    setHidden('dbWarn', true);
+    pump();
   }, function(e){
-    store.writing = false;
-    if (!store.pending) store.pending = json;
+    if (!store.queue[path]) { store.queue[path] = w; store.order.unshift(path); }
     var code = e && e.code ? e.code : 'unavailable';
-    if (code === 'unavailable' && !store.retried) { store.retried = true; setTimeout(flushDb, 700 + Math.floor(Math.random() * 800)); return; }
-    $('dbWarnText').textContent = 'Cod: ' + code + '. Modificările rămân în această pagină și se reîncearcă la următoarea salvare.';
-    setHidden('dbWarn', false);
+    if (code === 'unavailable' && !store.retried) {
+      store.retried = true;
+      /* rămâne „busy” cât așteptăm: nicio altă scriere nu pornește în paralel */
+      setTimeout(function(){ store.busy = false; store.inflight = null; pump(); }, delayRand());
+      return;
+    }
+    store.busy = false; store.inflight = null;
+    dbWarn('Cod: ' + code + '. Modificările rămân în această pagină și se reîncearcă la următoarea salvare.');
   });
 }
-function subscribeDb(){
-  store.ref.onSnapshot(function(snap){
-    if (!snap.exists || snap.metadata.hasPendingWrites) return;
-    var json = normalizat(snap.data());
-    if (json === store.lastWritten || json === normalizat(state)) return;
-    state = JSON.parse(json); store.lastWritten = json;
-    rebuildAll(); renderSeedNotice(); toast('Date actualizate de pe alt dispozitiv');
-  }, function(){ /* abonarea s-a încheiat; pagina continuă cu ce are */ });
+
+/* --- baza de date: încărcare și abonare --- */
+function applySetariRemote(obj){
+  var m = migrate(Object.assign({}, obj, { citiri:state.citiri }));
+  state.tarife = m.tarife; state.bazaCalcul = m.bazaCalcul; state.alteEstimare = m.alteEstimare;
+  state.alteCheltuieli = m.alteCheltuieli; state.seedNoticeDismissed = m.seedNoticeDismissed;
 }
-function finishLoading(){ document.body.classList.remove('is-loading'); setHidden('loadingNotice', true); }
+function docToCitire(d){
+  var data = d.data(); if (!data) return null;
+  var copy = {}; Object.keys(data).forEach(function(k){ copy[k] = data[k]; }); copy.id = d.id;
+  return normCitire(copy);
+}
+function applyCitiriSnapshot(qs){
+  var remote = {};
+  qs.docs.forEach(function(d){ var c = docToCitire(d); if (c) remote[c.id] = c; });
+  var next = [], changed = false, seen = {};
+  state.citiri.forEach(function(c){
+    var path = DB_CITIRI + '/' + c.id;
+    seen[c.id] = true;
+    if (pendingFor(path)) { next.push(c); return; }
+    if (remote[c.id]) {
+      var rj = JSON.stringify(remote[c.id]);
+      if (rj !== JSON.stringify(normCitire(c))) { changed = true; next.push(remote[c.id]); } else next.push(c);
+      store.last.citiri[c.id] = rj;
+    } else { changed = true; delete store.last.citiri[c.id]; }
+  });
+  Object.keys(remote).forEach(function(id){
+    if (seen[id] || pendingFor(DB_CITIRI + '/' + id)) return;
+    next.push(remote[id]); store.last.citiri[id] = JSON.stringify(remote[id]); changed = true;
+  });
+  if (!changed) return;
+  state.citiri = next;
+  if (editId && !state.citiri.some(function(c){ return c.id === editId; })) resetForm();
+  refreshUI(); renderSeedNotice(); toast('Date actualizate de pe alt dispozitiv');
+}
+function onSubError(resub){
+  return function(e){
+    if (e && e.code === 'unavailable' && store.resubs < 3) { store.resubs++; setTimeout(resub, 1500); }
+  };
+}
+function subscribeSetari(){
+  store.unsubs.push(store.setariRef.onSnapshot(function(snap){
+    if (snap.metadata.fromCache || !snap.exists || pendingFor(DB_SETARI)) return;
+    var j = JSON.stringify(setariDin(migrate(Object.assign({}, snap.data(), { citiri:[] }))));
+    if (j === store.last.setari) return;
+    applySetariRemote(snap.data()); store.last.setari = j;
+    refreshUI(); renderSeedNotice(); toast('Date actualizate de pe alt dispozitiv');
+  }, onSubError(subscribeSetari)));
+}
+function subscribeCitiri(){
+  store.unsubs.push(store.citiriRef.onSnapshot(function(qs){
+    if (qs.metadata.fromCache) return;
+    applyCitiriSnapshot(qs);
+  }, onSubError(subscribeCitiri)));
+}
+function loadDb(){
+  return retryOnce(function(){ return Promise.all([store.setariRef.get(), store.citiriRef.get()]); }).then(function(res){
+    var sSnap = res[0], qs = res[1];
+    store.mode = 'db';
+    if (!sSnap.exists && qs.empty) {
+      /* prima pornire cu baza de date: copia din browser (dacă există) devine conținutul bazei */
+      state = loadLocal(); store.last = { setari:'', citiri:{} }; saveDb();
+    } else {
+      var citiri = []; qs.docs.forEach(function(d){ var c = docToCitire(d); if (c) citiri.push(c); });
+      var obj = sSnap.exists ? Object.assign({}, sSnap.data(), { citiri:citiri }) : { citiri:citiri };
+      state = migrate(obj);
+      store.last.setari = sSnap.exists ? JSON.stringify(setariDin(state)) : '';
+      store.last.citiri = {}; state.citiri.forEach(function(c){ store.last.citiri[c.id] = JSON.stringify(c); });
+      if (!sSnap.exists) saveDb();
+    }
+    subscribeSetari(); subscribeCitiri();
+  });
+}
+function finishLoading(){
+  document.body.classList.remove('is-loading');
+  var pg = document.querySelector('.page'); if (pg) { pg.inert = false; pg.removeAttribute('aria-busy'); }
+  setHidden('loadingNotice', true);
+}
+var MSG_FARA_DB = 'Baza de date nu este disponibilă în această deschidere a paginii. Ce introduci acum rămâne doar în acest browser și nu se sincronizează cu alte dispozitive. Deschide pagina din claude.ai și reîncarc-o ca să reîncerci.';
 function startStorage(){
   if (!hasClaude()) { store.mode = 'local'; state = loadLocal(); return Promise.resolve(); }
   store.mode = 'loading'; state = defaultState();
-  document.body.classList.add('is-loading'); setHidden('loadingNotice', false);
+  document.body.classList.add('is-loading');
+  var pg = document.querySelector('.page'); if (pg) { pg.inert = true; pg.setAttribute('aria-busy', 'true'); }
+  setHidden('loadingNotice', false);
   window.claude.use('downloads').then(function(d){ store.downloads = d || null; }, function(){ store.downloads = null; });
   return window.claude.use('db').then(function(db){
-    if (!db) { store.mode = 'local'; state = loadLocal(); return; }
-    store.ref = db.doc(DB_PATH);
-    return store.ref.get().then(function(snap){
-      store.mode = 'db';
-      if (snap.exists) { state = migrate(snap.data()); store.lastWritten = normalizat(state); }
-      else { state = defaultState(); store.lastWritten = ''; queueDbWrite(); }
-      subscribeDb();
-    });
+    if (!db) { store.mode = 'local'; state = loadLocal(); dbWarn(MSG_FARA_DB); return; }
+    store.db = db; store.setariRef = db.doc(DB_SETARI); store.citiriRef = db.collection(DB_CITIRI);
+    return loadDb();
   }).catch(function(e){
     store.mode = 'local'; state = loadLocal();
-    $('dbWarnText').textContent = 'Cod: ' + (e && e.code ? e.code : 'unavailable') + '. Pagina folosește memoria acestui browser până la o reîncărcare reușită.';
-    setHidden('dbWarn', false);
+    dbWarn('Cod: ' + (e && e.code ? e.code : 'unavailable') + '. ' + MSG_FARA_DB);
+  }).then(function(){
+    if (store.dirtyDuringLoad) { store.dirtyDuringLoad = false; toast('O modificare făcută în timpul încărcării nu a fost salvată. Te rog reia-o.'); }
   });
 }
 
@@ -1368,8 +1490,11 @@ function renderDerived(){
   $('bazaUltima').setAttribute('aria-pressed', state.bazaCalcul === 'ultima' ? 'true' : 'false');
   $('bazaTrei').setAttribute('aria-pressed', state.bazaCalcul === 'ultimele3' ? 'true' : 'false');
 }
+function refreshUI(){
+  $('tarife').innerHTML = ''; buildTarife(); buildAlte(); renderDerived();
+}
 function rebuildAll(){
-  $('tarife').innerHTML = ''; buildTarife(); buildAlte(); resetForm(); renderDerived();
+  refreshUI(); resetForm(); renderDerived();
 }
 function init(){
   try { applyTheme(localStorage.getItem(THEME_KEY) || 'auto'); } catch (e) { applyTheme('auto'); }
