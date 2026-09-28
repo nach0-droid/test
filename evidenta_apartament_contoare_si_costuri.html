@@ -279,9 +279,9 @@ footer.foot{padding-top:26px;color:var(--muted);font-size:13.5px;max-width:70ch}
   <div class="notice" id="onboarding" hidden>
     <b>Cum pornești</b>
     <ol>
-      <li><b>Tarife</b>: trece prețul pe kWh la electricitate și pe m³ la gaz și apă rece (cu TVA, așa cum reiese din factură).</li>
+      <li><b>Tarife</b>: sunt deja completate din facturile tale (electricitate, gaz E.ON, apă rece de pe nota de plată). Verifică-le și modifică-le când se schimbă.</li>
       <li><b>Citiri</b>: prima citire este cea de la mutare, cu <b>data mutării</b> pusă la „Data citirii”. A doua este cea de acum, cu data de azi. Cardul „De plată pentru perioada” arată apoi exact cât costă intervalul dintre ele.</li>
-      <li><b>Alte cheltuieli de ansamblu</b>: completează sumele lunare din ianuarie până în august; media lor intră la întreținere.</li>
+      <li><b>Alte cheltuieli de ansamblu</b>: lunile februarie–iunie sunt completate din notele de plată (fără apa rece). Adaugă lunile următoare când primești nota; media lunilor bifate intră la întreținere.</li>
     </ol>
   </div>
 
@@ -335,7 +335,7 @@ footer.foot{padding-top:26px;color:var(--muted);font-size:13.5px;max-width:70ch}
       <section class="card" id="tarifeCard">
         <header>
           <h2>Tarife</h2>
-          <p>Prețul efectiv pe unitate, cu TVA inclus. Dacă nu îl știi, deschide „Calculează din factură”.</p>
+          <p>Prețul efectiv pe unitate, cu TVA inclus, precompletat din facturile tale. Când primești o factură nouă, verifică-l sau recalculează-l cu „Calculează din factură”.</p>
         </header>
         <div class="stack-sm" id="tarife"></div>
       </section>
@@ -429,15 +429,29 @@ var perioadaTouched = false;
 var wipeArmed = null;
 var plataPer = null;
 
+/* Date inițiale, calculate din facturile primite în septembrie 2026. Se pot modifica oricând din pagină.
+   - electricitate: 1,3019 lei/kWh fără TVA + TVA 21% (factura 14.05–31.08.2026, tarifele din iulie)
+   - gaz E.ON: 0,2632 lei/kWh cu TVA (după OUG 12/2026), PCS 10,461 kWh/m³, abonament 0,73 lei/zi + TVA
+   - apă rece (nota de plată administrație): AR 7,8588 + canal rece 8,3361 = 16,1949 lei/m³
+   - alte cheltuieli de ansamblu: total lună curentă minus liniile de apă rece, notele de plată feb.–iun. 2026 */
+var SEED_TARIFE = {
+  el:{ pret:1.5753, abonamentZi:null },
+  gaz:{ pret:0.2632, pretPe:'kwh', factorKwhPerM3:10.461, abonamentZi:0.8833 },
+  apa:{ pret:16.1949, abonamentZi:null }
+};
+var SEED_ALTE = [['2026-01', null], ['2026-02', 291.89], ['2026-03', 277.10], ['2026-04', 275.60], ['2026-05', 261.92], ['2026-06', 294.23], ['2026-07', null], ['2026-08', null]];
+function seedAlte(){ return SEED_ALTE.map(function(x){ return { luna:x[0], suma:x[1], inclus:true }; }); }
 function defaultState(){
-  var ac = [];
-  for (var m = 1; m <= 8; m++) ac.push({ luna:'2026-' + pad(m), suma:null, inclus:true });
   return {
     version:1,
-    tarife:{ el:{ pret:null, abonamentZi:null }, gaz:{ pret:null, pretPe:'m3', factorKwhPerM3:10.6, abonamentZi:null }, apa:{ pret:null, abonamentZi:null } },
+    tarife:{
+      el:{ pret:SEED_TARIFE.el.pret, abonamentZi:null },
+      gaz:{ pret:SEED_TARIFE.gaz.pret, pretPe:SEED_TARIFE.gaz.pretPe, factorKwhPerM3:SEED_TARIFE.gaz.factorKwhPerM3, abonamentZi:SEED_TARIFE.gaz.abonamentZi },
+      apa:{ pret:SEED_TARIFE.apa.pret, abonamentZi:null }
+    },
     bazaCalcul:'ultima',
     citiri:[],
-    alteCheltuieli:ac
+    alteCheltuieli:seedAlte()
   };
 }
 function migrate(s){
@@ -471,6 +485,14 @@ function migrate(s){
     out.alteCheltuieli.push({ luna:a.luna, suma:numOrNull(a.suma), inclus:a.inclus !== false });
   });
   else out.alteCheltuieli = d.alteCheltuieli;
+  /* stare încă necompletată (tarif gol, sau nicio sumă la alte cheltuieli): preia datele inițiale */
+  if (out.tarife.el.pret == null) out.tarife.el.pret = SEED_TARIFE.el.pret;
+  if (out.tarife.gaz.pret == null) {
+    out.tarife.gaz.pret = SEED_TARIFE.gaz.pret; out.tarife.gaz.pretPe = SEED_TARIFE.gaz.pretPe; out.tarife.gaz.factorKwhPerM3 = SEED_TARIFE.gaz.factorKwhPerM3;
+    if (out.tarife.gaz.abonamentZi == null) out.tarife.gaz.abonamentZi = SEED_TARIFE.gaz.abonamentZi;
+  }
+  if (out.tarife.apa.pret == null) out.tarife.apa.pret = SEED_TARIFE.apa.pret;
+  if (out.alteCheltuieli.every(function(a){ return a.suma == null; })) out.alteCheltuieli = seedAlte();
   return out;
 }
 function numOrNull(v){ return (typeof v === 'number' && isFinite(v)) ? v : null; }
